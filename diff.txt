@@ -1,0 +1,181 @@
+diff --git a/parlai/agents/face/face.py b/parlai/agents/face/face.py
+index fbf5767..aa7b561 100644
+--- a/parlai/agents/face/face.py
++++ b/parlai/agents/face/face.py
+@@ -12,9 +12,9 @@
+ # via shaojiejiang.1991@gmail.com
+ 
+ from parlai.core.torch_generator_agent import TorchGeneratorAgent
+-from .modules import Seq2seq, opt_to_kwargs, HLoss
+-from parlai.core.utils import NEAR_INF, padded_tensor, round_sigfigs, warn_once
+-from parlai.core.torch_agent import TorchAgent, Output
++from parlai.agents.face.modules import Seq2seq, opt_to_kwargs, HLoss
++from parlai.core.utils import padded_tensor, round_sigfigs, warn_once
++from parlai.core.torch_agent import Output
+ 
+ import torch
+ import torch.nn as nn
+diff --git a/parlai/agents/face/modules.py b/parlai/agents/face/modules.py
+index 93128bc..c240b6b 100644
+--- a/parlai/agents/face/modules.py
++++ b/parlai/agents/face/modules.py
+@@ -175,7 +175,7 @@ class Seq2seq(TorchGeneratorModel):
+ 
+         # use cached encoding if available
+         encoder_states = prev_enc if prev_enc is not None else self.encoder(xs)
+-        if False:#ys is not None:
++        if ys is not None:
+             # use teacher forcing
+             logits, preds = self.decode_forced(encoder_states, ys)
+         else:
+diff --git a/parlai/agents/face_tsfm/face.py b/parlai/agents/face_tsfm/face.py
+index 20228fa..593ad14 100644
+--- a/parlai/agents/face_tsfm/face.py
++++ b/parlai/agents/face_tsfm/face.py
+@@ -315,10 +315,10 @@ class FaceAgent(TorchGeneratorAgent):
+         # set up criteria
+         if self.opt.get('numsoftmax', 1) > 1:
+             self.criterion = nn.NLLLoss(
+-                ignore_index=self.NULL_IDX, size_average=False)
++                ignore_index=self.NULL_IDX, reduction="sum")
+         else:
+             self.criterion = nn.CrossEntropyLoss(
+-                ignore_index=self.NULL_IDX, size_average=False)
++                ignore_index=self.NULL_IDX, reduction="sum")
+ 
+         if self.use_cuda:
+             self.criterion.cuda()
+diff --git a/parlai/agents/face_tsfm/modules.py b/parlai/agents/face_tsfm/modules.py
+index 505bfcc..851b62d 100644
+--- a/parlai/agents/face_tsfm/modules.py
++++ b/parlai/agents/face_tsfm/modules.py
+@@ -497,6 +497,37 @@ class TransformerGeneratorModel(TorchGeneratorModel):
+         output = F.linear(tensor, self.embeddings.weight)
+         return output
+ 
++    def decode_forced(self, encoder_states, ys):
++        bsz = ys.size(0)
++        seqlen = ys.size(1)
++        inputs = ys.narrow(1, 0, seqlen - 1)
++        inputs = torch.cat([self._starts(bsz), inputs], 1)
++        dec_out, _ = self.decoder(inputs, encoder_states)
++        logits = self.output(dec_out)
++        _, preds = logits.max(dim=2)
++        return logits, preds
++
++    def decode_greedy(self, encoder_states, bsz, maxlen):
++        xs = self._starts(bsz)
++        incr_state = None
++        logits = []
++        # generate template
++        for i in range(maxlen):
++            # todo, break early if all beams saw EOS
++            dec_out, incr_state = self.decoder(xs, encoder_states, incremental_state=incr_state)
++            scores = self.output(dec_out)
++            _, preds = scores.max(dim=-1)
++            logits.append(scores)
++            xs = torch.cat([xs, preds], dim=1)
++            # check if everyone has generated an end token
++            all_finished = ((xs == self.END_IDX).sum(dim=1) > 0).sum().item() == bsz
++            if all_finished:
++                break
++        logits = torch.cat(logits, 1)
++        preds = xs
++
++        return logits, preds[:, 1:]
++
+ 
+ class BasicAttention(nn.Module):
+     def __init__(self, dim=1, attn='cosine'):
+diff --git a/parlai/agents/yda/yda.py b/parlai/agents/yda/yda.py
+index 20228fa..99b82c2 100644
+--- a/parlai/agents/yda/yda.py
++++ b/parlai/agents/yda/yda.py
+@@ -1,15 +1,15 @@
+ #!/usr/bin/env python3
+ 
+-# Copyright (c) 2019-present, Shaojie Jiang.
++# Copyright (c) 2020-present, Yida Wang.
+ # All rights reserved.
+ # This source code is licensed under the BSD-style license found in the
+ # LICENSE file in the root directory of this source tree.
+ #
+-# This programme is modified on top of the Seq2Seq implementation of Facebook Inc.,
++# This programme is modified on top of the Trasnformer implementation of Facebook Inc.,
+ # please visit http://parl.ai/ for more details.
+ #
+-# Should you have any problems using this programme, please contact Shaojie Jiang
+-# via shaojiejiang.1991@gmail.com
++# Should you have any problems using this programme, please contact Yda Wang
++# via 79388548@qq.com
+ 
+ from parlai.core.torch_generator_agent import TorchGeneratorAgent
+ from parlai.core.utils import NEAR_INF, padded_tensor, round_sigfigs, warn_once
+@@ -27,55 +27,12 @@ from collections import Counter
+ from .modules import TransformerGeneratorModel
+ 
+ 
+-class FaceAgent(TorchGeneratorAgent):
++class YdaAgent(TorchGeneratorAgent):
+ 
+     @classmethod
+     def add_cmdline_args(cls, argparser):
+         """Add command-line arguments specifically for this agent."""
+         agent = argparser.add_argument_group('Face Arguments')
+-        # agent.add_argument('--init-model', type=str, default=None,
+-        #                    help='load dict/model/opts from this path')
+-        # agent.add_argument('-hs', '--hiddensize', type=int, default=128,
+-        #                    help='size of the hidden layers')
+-        # agent.add_argument('-esz', '--embeddingsize', type=int, default=128,
+-        #                    help='size of the token embeddings')
+-        # agent.add_argument('-nl', '--numlayers', type=int, default=2,
+-        #                    help='number of hidden layers')
+-        # agent.add_argument('-dr', '--dropout', type=float, default=0.1,
+-        #                    help='dropout rate')
+-        # agent.add_argument('-bi', '--bidirectional', type='bool',
+-        #                    default=False,
+-        #                    help='whether to encode the context with a '
+-        #                         'bidirectional rnn')
+-        # agent.add_argument('-att', '--attention', default='none',
+-        #                    choices=['none', 'concat', 'general', 'dot',
+-        #                             'local'],
+-        #                    help='Choices: none, concat, general, local. '
+-        #                         'If set local, also set attention-length. '
+-        #                         '(see arxiv.org/abs/1508.04025)')
+-        # agent.add_argument('-attl', '--attention-length', default=48, type=int,
+-        #                    help='Length of local attention.')
+-        # agent.add_argument('--attention-time', default='post',
+-        #                    choices=['pre', 'post'],
+-        #                    help='Whether to apply attention before or after '
+-        #                         'decoding.')
+-        # agent.add_argument('-dec', '--decoder', default='same',
+-        #                    choices=['same', 'shared'],
+-        #                    help='Choose between different decoder modules. '
+-        #                         'Default "same" uses same class as encoder, '
+-        #                         'while "shared" also uses the same weights. '
+-        #                         'Note that shared disabled some encoder '
+-        #                         'options--in particular, bidirectionality.')
+-        agent.add_argument('-lt', '--lookuptable', default='unique',
+-                           choices=['unique', 'enc_dec', 'dec_out', 'all'],
+-                           help='The encoder, decoder, and output modules can '
+-                                'share weights, or not. '
+-                                'Unique has independent embeddings for each. '
+-                                'Enc_dec shares the embedding for the encoder '
+-                                'and decoder. '
+-                                'Dec_out shares decoder embedding and output '
+-                                'weights. '
+-                                'All shares all three weights.')
+         agent.add_argument('-soft', '--numsoftmax', default=1, type=int,
+                            help='default 1, if greater then uses mixture of '
+                                 'softmax (see arxiv.org/abs/1711.03953).')
+@@ -113,8 +70,8 @@ class FaceAgent(TorchGeneratorAgent):
+                            help='Number of positional embeddings to learn. Defaults '
+                                 'to truncate or 1024 if not provided.')
+ 
+-        super(cls, FaceAgent).add_cmdline_args(argparser)
+-        FaceAgent.dictionary_class().add_cmdline_args(argparser)
++        super(cls, YdaAgent).add_cmdline_args(argparser)
++        YdaAgent.dictionary_class().add_cmdline_args(argparser)
+         return agent
+ 
+     @staticmethod
