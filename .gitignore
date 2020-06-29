@@ -132,3 +132,6 @@ heroku-cli-*
 
 # VSCode
 *.vscode
+
+# yida
+.idea*

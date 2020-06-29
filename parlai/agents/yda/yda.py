@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
-# Copyright (c) 2020-present, Yida Wang.
+# Copyright (c) 2019-present, Shaojie Jiang.
 # All rights reserved.
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# This programme is modified on top of the Trasnformer implementation of Facebook Inc.,
+# This programme is modified on top of the Seq2Seq implementation of Facebook Inc.,
 # please visit http://parl.ai/ for more details.
 #
-# Should you have any problems using this programme, please contact Yda Wang
-# via 79388548@qq.com
+# Should you have any problems using this programme, please contact Shaojie Jiang
+# via shaojiejiang.1991@gmail.com
 
 from parlai.core.torch_generator_agent import TorchGeneratorAgent
 from parlai.core.utils import NEAR_INF, padded_tensor, round_sigfigs, warn_once
@@ -24,7 +24,7 @@ import math
 import numpy as np
 from collections import Counter
 
-from .modules import TransformerGeneratorModel
+from .modules import YdaModel
 
 
 class YdaAgent(TorchGeneratorAgent):
@@ -33,6 +33,10 @@ class YdaAgent(TorchGeneratorAgent):
     def add_cmdline_args(cls, argparser):
         """Add command-line arguments specifically for this agent."""
         agent = argparser.add_argument_group('Face Arguments')
+        agent.add_argument('--init-model', type=str, default=None,
+                           help='load dict/model/opts from this path')
+        agent.add_argument('-yda', '--yda', default=True,
+                           help='Yda training strategy.')
         agent.add_argument('-soft', '--numsoftmax', default=1, type=int,
                            help='default 1, if greater then uses mixture of '
                                 'softmax (see arxiv.org/abs/1711.03953).')
@@ -91,8 +95,12 @@ class YdaAgent(TorchGeneratorAgent):
         self.masked_entropy = HLoss(ignore_index=self.NULL_IDX)
         self.ideal_entropy = math.log(1 / len(self.dict))
 
+        self.yda = opt["yda"]
+        self.metrics['cloze_correct_tokens'] = 0
+        self.metrics['cloze_loss'] = 0
+
     def build_model(self, states=None):
-        self.model = TransformerGeneratorModel(self.opt, self.dict)
+        self.model = YdaModel(self.opt, self.dict)
         if self.opt['embedding_type'] != 'random':
             self._copy_embeddings(
                 self.model.encoder.embeddings.weight, self.opt['embedding_type']
@@ -106,11 +114,19 @@ class YdaAgent(TorchGeneratorAgent):
         if self.use_cuda and (force or not hasattr(self, 'buffer_initialized')):
             try:
                 dummy_xs = torch.ones(batchsize, maxlen).long().cuda()
-                dummy_ys = torch.ones(batchsize, 2).long().cuda()
-                scores, _, _ = self.model(dummy_xs, dummy_ys)
-                loss = self.criterion(
-                    scores.view(-1, scores.size(-1)), dummy_ys.view(-1)
-                )
+                dummy_ys = torch.ones(batchsize, 3).long().cuda()
+                scores, _, _, label_scores = self.model(dummy_xs, dummy_ys)
+                if self.yda:
+                    label_scores = label_scores.view(-1, label_scores.size(-1))
+                    label_loss = F.cross_entropy(label_scores, dummy_ys.view(-1),
+                                                 ignore_index=self.criterion.ignore_index, reduction="sum")
+                    loss = self.criterion(scores.view(-1, scores.size(-1)), dummy_ys.view(-1),
+                                          label_scores, dummy_ys.size())
+                    loss += label_loss
+                else:
+                    loss = self.criterion(
+                        scores.view(-1, scores.size(-1)), dummy_ys.view(-1)
+                    )
                 loss.backward()
                 self.buffer_initialized = True
             except RuntimeError as e:
@@ -131,7 +147,7 @@ class YdaAgent(TorchGeneratorAgent):
         self.zero_grad()
 
         try:
-            scores, preds, _ = self.model(batch.text_vec, batch.label_vec)
+            scores, preds, _, label_scores = self.model(batch.text_vec, batch.label_vec)
             score_view = scores.view(-1, scores.size(-1))
             preds_clean = self.clean_preds(preds)
             # Update token frequency, or not
@@ -140,7 +156,12 @@ class YdaAgent(TorchGeneratorAgent):
             elif self.ft == 'out':
                 self.update_frequency(preds_clean)
             # calculate loss w/ or w/o pre-/post-weight
-            if self.wt == 'pre':
+            if self.yda:
+                label_scores_view = label_scores.view(-1, label_scores.size(-1))
+                label_loss = F.cross_entropy(label_scores_view, batch.label_vec.view(-1),
+                                             ignore_index=self.criterion.ignore_index, reduction="sum")
+                loss = self.criterion(score_view, batch.label_vec.view(-1), label_scores_view, batch.label_vec.size())
+            elif self.wt == 'pre':
                 self.criterion.weight = self.loss_weight()
                 loss = self.criterion(score_view, batch.label_vec.view(-1))
             elif self.wt == 'post':
@@ -178,6 +199,12 @@ class YdaAgent(TorchGeneratorAgent):
             self.metrics['loss'] += loss.item()
             self.metrics['num_tokens'] += target_tokens
             self.metrics['preds'].extend(preds_clean)
+            if self.yda:
+                cloze_preds = label_scores.max(-1)[1]
+                cloze_correct = ((batch.label_vec == cloze_preds) * notnull).sum().item()
+                self.metrics['cloze_correct_tokens'] += cloze_correct
+                self.metrics['cloze_loss'] += label_loss.item()
+                loss += label_loss
             loss = loss / target_tokens
             loss.backward()
             self.update_params()
@@ -207,7 +234,7 @@ class YdaAgent(TorchGeneratorAgent):
             scores, preds, _ = self.model(batch.text_vec, batch.label_vec)
         elif self.beam_size == 1:
             # greedy decode
-            scores, preds, _ = self.model(batch.text_vec)
+            scores, preds, _, _ = self.model(batch.text_vec)
         elif self.beam_size > 1:
             out = self.beam_search(
                 self.model,
@@ -228,14 +255,25 @@ class YdaAgent(TorchGeneratorAgent):
 
         if batch.label_vec is not None:
             # calculate loss on targets with teacher forcing
-            f_scores, f_preds, _ = self.model(batch.text_vec, batch.label_vec)
+            f_scores, f_preds, _, f_label_scores = self.model(batch.text_vec, batch.label_vec)
             score_view = f_scores.view(-1, f_scores.size(-1))
-            self.criterion.reduction = 'sum'
-            loss = self.criterion(score_view, batch.label_vec.view(-1))
             # save loss to metrics
             notnull = batch.label_vec.ne(self.NULL_IDX)
             target_tokens = notnull.long().sum().item()
             correct = ((batch.label_vec == f_preds) * notnull).sum().item()
+            self.criterion.reduction = 'sum'
+            if self.yda:
+                cloze_preds = f_label_scores.max(-1)[1]
+                cloze_correct = ((batch.label_vec == cloze_preds) * notnull).sum().item()
+                f_label_scores = f_label_scores.view(-1, f_label_scores.size(-1))
+                label_loss = F.cross_entropy(f_label_scores, batch.label_vec.view(-1),
+                                             ignore_index=self.criterion.ignore_index, reduction="sum")
+                loss = self.criterion(score_view, batch.label_vec.view(-1),
+                                      f_label_scores, batch.label_vec.size())
+                self.metrics['cloze_correct_tokens'] += cloze_correct
+                self.metrics['cloze_loss'] += label_loss.item()
+            else:
+                loss = self.criterion(score_view, batch.label_vec.view(-1))
             self.metrics['correct_tokens'] += correct
             self.metrics['loss'] += loss.item()
             self.metrics['num_tokens'] += target_tokens
@@ -270,12 +308,15 @@ class YdaAgent(TorchGeneratorAgent):
 
     def build_criterion(self):
         # set up criteria
-        if self.opt.get('numsoftmax', 1) > 1:
+        if self.opt.get("yda", None):
+            self.criterion = YdaLoss(ignore_index=self.NULL_IDX, reduction="sum",
+                                     sample_weight=self.opt.get("yda_weight", False))
+        elif self.opt.get('numsoftmax', 1) > 1:
             self.criterion = nn.NLLLoss(
-                ignore_index=self.NULL_IDX, size_average=False)
+                ignore_index=self.NULL_IDX, reduction="sum")
         else:
             self.criterion = nn.CrossEntropyLoss(
-                ignore_index=self.NULL_IDX, size_average=False)
+                ignore_index=self.NULL_IDX, reduction="sum")
 
         if self.use_cuda:
             self.criterion.cuda()
@@ -352,6 +393,8 @@ class YdaAgent(TorchGeneratorAgent):
         self.metrics['num_tokens'] = 0
         self.metrics['correct_tokens'] = 0
         self.metrics['preds'] = []
+        self.metrics['cloze_correct_tokens'] = 0
+        self.metrics['cloze_loss'] = 0
 
     def clean_preds(self, preds):
         res = []
@@ -394,6 +437,14 @@ class YdaAgent(TorchGeneratorAgent):
         if num_tok > 0:
             if self.metrics['correct_tokens'] > 0:
                 m['token_acc'] = self.metrics['correct_tokens'] / num_tok
+            if self.metrics['cloze_correct_tokens'] > 0:
+                m['cloze_token_acc'] = self.metrics['cloze_correct_tokens'] / num_tok
+            if self.yda:
+                m['cloze_loss'] = self.metrics['cloze_loss'] / num_tok
+                try:
+                    m['cloze_ppl'] = math.exp(m['cloze_loss'])
+                except OverflowError:
+                    m['cloze_ppl'] = float('inf')
             m['loss'] = self.metrics['loss'] / num_tok
             try:
                 m['ppl'] = math.exp(m['loss'])
@@ -445,3 +496,160 @@ class HLoss(nn.Module):
         b = F.softmax(x, dim=1) * F.log_softmax(x, dim=1)
         b = -1.0 * torch.matmul(mask, b.sum(dim=1))
         return b
+
+
+class YdaLoss(nn.Module):
+    """
+    With yda label,
+    KL-divergence between q_{smoothed ground truth prob.}(w)
+    and p_{prob. computed by model}(w) is minimized.
+    """
+
+    def __init__(self, ignore_index=-100, reduction='sum', sample_weight=False, eos_index=3,
+                 yida_smoothing="diag"):
+        self.ignore_index = ignore_index
+        self.eos_index = eos_index
+        super(YdaLoss, self).__init__()
+        self.yida_smoothing = yida_smoothing
+        self.reduction = reduction
+        self.sample_weight = sample_weight
+        self.step = 0
+
+    def forward(self, output, target, label_scores, batch_shape):
+        """
+        output (FloatTensor): batch_size x n_classes
+        target (LongTensor): batch_size
+        """
+        if self.yida_smoothing == "diag" or self.yida_smoothing == "BERT":
+            v = self._v_diag(label_scores, target)
+        elif self.yida_smoothing == "distill":
+            v = self._v_distill(label_scores)
+        else:
+            raise Exception
+
+        # epsilon = self._yida_vmax_epsilon(output, target, v)
+        epsilon = self._yida_halfmax_epsilon(output, target)
+
+        self.sample_weight = True
+        if self.sample_weight and not isinstance(label_scores, list):
+            self.step += 1
+            if self.step > 0:
+                # weights = self._B_weight(label_scores, target, tgt_batch)
+                # weights = self._C_weight(temp_for_c.view(tgt_batch.size(0), tgt_batch.size(1)),
+                #                          output.detach().clone().view(tgt_batch.size(0), tgt_batch.size(1), -1),
+                #                          tgt_batch)
+                # weights = self._CE_weight(output.detach().clone().view(tgt_batch.size(0), tgt_batch.size(1), -1),
+                #                          tgt_batch)
+                # weights = self._CE_weight(
+                #     label_scores.detach().clone().log_softmax(-1).view(tgt_batch.size(0), tgt_batch.size(1), -1),
+                #     tgt_batch)
+                weights = self._A_weight(
+                    output,
+                    target,
+                    batch_shape)
+                epsilon = epsilon.view(batch_shape[0], batch_shape[1])
+                epsilon = weights.unsqueeze(0) * epsilon
+                epsilon = epsilon.view(-1)
+
+        confidence = 1 - epsilon
+        smoothing_penalty = epsilon.unsqueeze(-1) * v
+
+        # model_prob = torch.zeros_like(epsilon, device=epsilon.device, dtype=torch.float)
+        # model_prob = model_prob.unsqueeze(1).repeat(1, self.tgt_vocab_size)
+        model_prob = torch.zeros_like(output, device=output.device, dtype=torch.float)
+        if False:
+            eos_mask = target.eq(self.eos_index)
+            confidence[eos_mask] = 1
+            smoothing_penalty.masked_fill_((target == self.eos_index).unsqueeze(1), 0)
+        model_prob.scatter_(1, target.unsqueeze(1), confidence.unsqueeze(1))
+        model_prob += smoothing_penalty
+        model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+        return F.kl_div(output.log_softmax(dim=-1), model_prob, reduction=self.reduction)
+
+    def _yida_halfmax_epsilon(self, output, target):
+        probs = output.detach().clone().softmax(dim=-1)
+        prob_max = probs.max(dim=1)[0]
+        prob_gtruth = probs.gather(dim=1, index=target.unsqueeze(1)).squeeze()
+        epsilon = 1 - prob_max
+        mask = epsilon.gt(0.5)
+        epsilon[mask] = 0.5
+        epsilon = prob_gtruth / prob_max * epsilon
+        return epsilon
+
+    def _yida_vmax_epsilon(self, output, target, v):
+        probs = output.detach().clone().softmax(dim=-1)
+        prob_max = probs.max(dim=1)[0]
+        prob_gtruth = probs.gather(dim=1, index=target.unsqueeze(1)).squeeze()
+        epsilon = 1 - prob_max
+        maxv = v.max(dim=-1)[0]
+        up_bond = 1 / (1 + maxv)
+        mask = epsilon.gt(up_bond)
+        epsilon[mask] = up_bond[mask]
+        epsilon = prob_gtruth / prob_max * epsilon
+        return epsilon
+
+    def _v_diag(self, label_scores, target):
+        # TODO(yida) grad thinking
+        v = label_scores.detach().clone()
+        v /= 1.5
+        # temp_for_c = v.clone().softmax(dim=-1)[gt_mask]
+        v.scatter_(1, target.unsqueeze(1), -float('inf'))
+        # v[gt_mask] = -float('inf')
+        v[:, self.ignore_index] = -float('inf')
+        v = v.softmax(dim=-1)
+        return v
+
+    def _compute_entropy(self, output):
+        entropy = -torch.sum(output.exp() * output, -1)
+        return entropy
+
+    def _B_weight(self, label_score, target, tgt_batch):
+        log_prob = label_score.detach().clone().log_softmax(-1)
+        entropy = self._compute_entropy(log_prob)
+        non_special = (target != self.ignore_index)  # & (target != self.eos_index)
+        non_special = non_special.view(tgt_batch.size(0), tgt_batch.size(1))
+        entropy = entropy.view(tgt_batch.size(0), tgt_batch.size(1))
+        entropy[~non_special] = 0
+        entropy = entropy.sum(0) / non_special.float().sum(0)
+        weight = entropy.softmax(-1)
+        # weight = entropy.sigmoid()
+        # weight = entropy /entropy.sum()
+        # weight = weight * tgt_batch.size(1)
+        weight = 1 - weight
+        return weight
+
+    def _C_weight(self, label_score, output, tgt_batch):
+        probs = output.exp()
+        prob_max = probs.max(dim=-1)[0]
+        prob_max[prob_max.lt(0.5)] = 0.5
+        ignore_mask = tgt_batch.eq(self.ignore_index)
+        diff = (label_score - prob_max)
+        diff[ignore_mask] = 0
+        diff = diff.sum(0) / (~ignore_mask).sum(0)
+        weight = 1 - diff
+        return weight
+
+    def _CE_weight(self, output, tgt_batch):
+        probs = output.exp()
+        non_pad = tgt_batch.ne(self.ignore_index)
+        pred = probs.max(dim=-1)[1]
+        correct = pred.eq(tgt_batch)
+        correct[~non_pad] = False
+        correct = correct.sum(0).float()
+        acc = correct / non_pad.sum(0).float()
+        prob_gtruth = probs.gather(dim=-1, index=tgt_batch.unsqueeze(-1)).squeeze()
+        prob_gtruth[~non_pad] = 0
+        prob_mean = prob_gtruth.sum(0) / non_pad.sum(0)
+        weight = 1 + (acc - prob_mean)
+        return weight
+
+    def _A_weight(self, output, target, batch_shape):
+        probs = output.detach().clone().view(batch_shape[0], batch_shape[1], -1).softmax(dim=-1)
+        non_pad = target.view(batch_shape[0], batch_shape[1]).ne(self.ignore_index)
+        pred = probs.max(dim=-1)[1]
+        correct = pred.eq(target.view(batch_shape[0], batch_shape[1]))
+        correct[~non_pad] = False
+        correct = correct.float().sum(0)
+        acc = correct / non_pad.float().sum(0)
+        weight = acc
+        return weight

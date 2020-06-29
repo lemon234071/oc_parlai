@@ -48,7 +48,7 @@ def _build_encoder(opt, dictionary, embedding=None, padding_idx=None, reduction=
 
 
 def _build_decoder(opt, dictionary, embedding=None, padding_idx=None,
-                   n_positions=1024):
+                   n_positions=1024, label_decoder=False):
     return TransformerDecoder(
         n_heads=opt['n_heads'],
         n_layers=opt['n_layers'],
@@ -62,11 +62,13 @@ def _build_decoder(opt, dictionary, embedding=None, padding_idx=None,
         learn_positional_embeddings=opt.get('learn_positional_embeddings', False),
         embeddings_scale=opt['embeddings_scale'],
         n_positions=n_positions,
+        label_decoder=label_decoder
     )
 
 
 class TransformerMemNetModel(nn.Module):
     """Model which takes context, memories, candidates and encodes them"""
+
     def __init__(self, opt, dictionary):
         super().__init__()
         self.opt = opt
@@ -182,6 +184,7 @@ def create_position_codes(n_pos, dim, out):
 
 class TransformerResponseWrapper(nn.Module):
     """Transformer response rapper. Pushes input through transformer and MLP"""
+
     def __init__(self, transformer, hdim):
         super(TransformerResponseWrapper, self).__init__()
         dim = transformer.out_dim
@@ -198,21 +201,22 @@ class TransformerResponseWrapper(nn.Module):
 
 class TransformerEncoder(nn.Module):
     """Transformer model"""
+
     def __init__(
-        self,
-        n_heads,
-        n_layers,
-        embedding_size,
-        ffn_size,
-        vocabulary_size,
-        embedding=None,
-        attention_dropout=0.0,
-        relu_dropout=0.0,
-        padding_idx=0,
-        learn_positional_embeddings=False,
-        embeddings_scale=False,
-        reduction=True,
-        n_positions=1024
+            self,
+            n_heads,
+            n_layers,
+            embedding_size,
+            ffn_size,
+            vocabulary_size,
+            embedding=None,
+            attention_dropout=0.0,
+            relu_dropout=0.0,
+            padding_idx=0,
+            learn_positional_embeddings=False,
+            embeddings_scale=False,
+            reduction=True,
+            n_positions=1024
     ):
         super(TransformerEncoder, self).__init__()
 
@@ -232,7 +236,7 @@ class TransformerEncoder(nn.Module):
         # check input formats:
         if embedding is not None:
             assert (
-                embedding_size is None or embedding_size == embedding.weight.shape[1]
+                    embedding_size is None or embedding_size == embedding.weight.shape[1]
             ), "Embedding dim must match the embedding size."
 
         if embedding is not None:
@@ -291,12 +295,12 @@ class TransformerEncoder(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(
-        self,
-        n_heads,
-        embedding_size,
-        ffn_size,
-        attention_dropout=0.0,
-        relu_dropout=0.0,
+            self,
+            n_heads,
+            embedding_size,
+            ffn_size,
+            attention_dropout=0.0,
+            relu_dropout=0.0,
     ):
         super().__init__()
         self.dim = embedding_size
@@ -319,24 +323,25 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerDecoder(nn.Module):
     def __init__(
-        self,
-        n_heads,
-        n_layers,
-        embedding_size,
-        ffn_size,
-        vocabulary_size,
-        embedding=None,
-        attention_dropout=0.0,
-        relu_dropout=0.0,
-        embeddings_scale=True,
-        learn_positional_embeddings=False,
-        padding_idx=None,
-        n_positions=1024,
+            self,
+            n_heads,
+            n_layers,
+            embedding_size,
+            ffn_size,
+            vocabulary_size,
+            embedding=None,
+            attention_dropout=0.0,
+            relu_dropout=0.0,
+            embeddings_scale=True,
+            learn_positional_embeddings=False,
+            padding_idx=None,
+            n_positions=1024,
+            label_decoder=False
     ):
         super().__init__()
         self.embedding_size = embedding_size
         self.ffn_size = ffn_size
-        self.n_layers = n_layers
+        self.n_layers = n_layers if not label_decoder else 1
         self.n_heads = n_heads
         self.dim = embedding_size
         self.embeddings_scale = embeddings_scale
@@ -360,7 +365,8 @@ class TransformerDecoder(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(self.n_layers):
             self.layers.append(TransformerDecoderLayer(
-                n_heads, embedding_size, ffn_size, attention_dropout, relu_dropout
+                n_heads, embedding_size, ffn_size, attention_dropout, relu_dropout,
+                label_decoder
             ))
 
     def forward(self, input, encoder_state, incr_state=None):
@@ -382,12 +388,13 @@ class TransformerDecoder(nn.Module):
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(
-        self,
-        n_heads,
-        embedding_size,
-        ffn_size,
-        attention_dropout=0.0,
-        relu_dropout=0.0,
+            self,
+            n_heads,
+            embedding_size,
+            ffn_size,
+            attention_dropout=0.0,
+            relu_dropout=0.0,
+            label_decoder=False
     ):
         super().__init__()
         self.dim = embedding_size
@@ -405,6 +412,8 @@ class TransformerDecoderLayer(nn.Module):
 
         self.ffn = TransformerFFN(embedding_size, ffn_size, dropout=relu_dropout)
         self.norm3 = nn.LayerNorm(embedding_size)
+
+        self.label_decoder = label_decoder
 
     def forward(self, x, encoder_output, encoder_mask):
         decoder_mask = self._create_selfattn_mask(x)
@@ -441,6 +450,8 @@ class TransformerDecoderLayer(nn.Module):
         time = x.size(1)
         # make sure that we don't look into the future
         mask = torch.tril(x.new(time, time).fill_(1))
+        if self.label_decoder:
+            mask += x.new(time, time).fill_(1).triu(diagonal=2)
         # broadcast across batch
         mask = mask.unsqueeze(0).expand(bsz, -1, -1)
         return mask
@@ -581,10 +592,10 @@ class MultiHeadAttention(nn.Module):
         # [B * n_heads, query_len, key_len]
         attn_mask = (
             (mask == 0)
-            .view(batch_size, 1, -1, key_len)
-            .repeat(1, n_heads, 1, 1)
-            .expand(batch_size, n_heads, query_len, key_len)
-            .view(batch_size * n_heads, query_len, key_len)
+                .view(batch_size, 1, -1, key_len)
+                .repeat(1, n_heads, 1, 1)
+                .expand(batch_size, n_heads, query_len, key_len)
+                .view(batch_size * n_heads, query_len, key_len)
         )
         assert attn_mask.shape == dot_prod.shape
         dot_prod.masked_fill_(attn_mask, -float(1e20))
@@ -595,9 +606,9 @@ class MultiHeadAttention(nn.Module):
         attentioned = attn_weights.bmm(v)
         attentioned = (
             attentioned
-            .view(batch_size, n_heads, query_len, dim_per_head)
-            .transpose(1, 2).contiguous()
-            .view(batch_size, query_len, dim)
+                .view(batch_size, n_heads, query_len, dim_per_head)
+                .transpose(1, 2).contiguous()
+                .view(batch_size, query_len, dim)
         )
 
         out = self.out_lin(attentioned)
@@ -620,3 +631,147 @@ class TransformerFFN(nn.Module):
         x = self.lin2(x)
         x = self.dropout(x)
         return x
+
+
+class YdaModel(TorchGeneratorModel):
+    def __init__(self, opt, dictionary):
+        super().__init__()
+        self.pad_idx = dictionary[dictionary.null_token]
+        self.embeddings = _create_embeddings(
+            dictionary, opt['embedding_size'], self.pad_idx
+        )
+
+        if opt.get('n_positions'):
+            # if the number of positions is explicitly provided, use that
+            n_positions = opt['n_positions']
+        else:
+            # else, use the worst case from truncate
+            n_positions = max(
+                opt.get('truncate') or 0,
+                opt.get('text_truncate') or 0,
+                opt.get('label_truncate') or 0
+            )
+            if n_positions == 0:
+                # default to 1024
+                n_positions = 1024
+
+        if n_positions < 0:
+            raise ValueError('n_positions must be positive')
+
+        self.encoder = _build_encoder(
+            opt, dictionary, self.embeddings, self.pad_idx, reduction=False,
+            n_positions=n_positions,
+        )
+        self.decoder = _build_decoder(
+            opt, dictionary, self.embeddings, self.pad_idx,
+            n_positions=n_positions,
+        )
+        self.label_decoder = _build_decoder(
+            opt, dictionary, self.embeddings, self.pad_idx,
+            n_positions=n_positions, label_decoder=True
+        )
+
+    def reorder_encoder_states(self, encoder_states, indices):
+        enc, mask = encoder_states
+        if not torch.is_tensor(indices):
+            indices = torch.LongTensor(indices).to(enc.device)
+        enc = torch.index_select(enc, 0, indices)
+        mask = torch.index_select(mask, 0, indices)
+        return enc, mask
+
+    def reorder_decoder_incremental_state(self, incremental_state, inds):
+        # no support for incremental decoding at this time
+        return None
+
+    def output(self, tensor):
+        # project back to vocabulary
+        output = F.linear(tensor, self.embeddings.weight)
+        return output
+
+    def forward(self, xs, ys=None, cand_params=None, prev_enc=None, maxlen=None):
+        """Get output predictions from the model.
+
+        :param xs: input to the encoder
+        :type xs: LongTensor[bsz, seqlen]
+        :param ys: Expected output from the decoder. Used
+            for teacher forcing to calculate loss.
+        :type ys: LongTensor[bsz, outlen]
+        :param prev_enc: if you know you'll pass in the same xs multiple times,
+            you can pass in the encoder output from the last forward pass to skip
+            recalcuating the same encoder output.
+        :param maxlen: max number of tokens to decode. if not set, will use the
+            length of the longest label this model has seen. ignored when ys is not
+            None.
+
+        :return: (scores, candidate_scores, encoder_states) tuple
+
+            - scores contains the model's predicted token scores.
+              (FloatTensor[bsz, seqlen, num_features])
+            - candidate_scores are the score the model assigned to each candidate.
+              (FloatTensor[bsz, num_cands])
+            - encoder_states are the output of model.encoder. Model specific types.
+              Feed this back in to skip encoding on the next call.
+        """
+        if ys is not None:
+            # TODO: get rid of longest_label
+            # keep track of longest label we've ever seen
+            # we'll never produce longer ones than that during prediction
+            self.longest_label = max(self.longest_label, ys.size(1))
+
+        # use cached encoding if available
+        encoder_states = prev_enc if prev_enc is not None else self.encoder(xs)
+
+        if ys is not None:
+            # use teacher forcing
+            scores, preds, label_scores = self.decode_forced(encoder_states, ys)
+        else:
+            bsz = xs.size(0)
+            scores, preds = self.decode_greedy(
+                encoder_states,
+                bsz,
+                maxlen or self.longest_label
+            )
+            label_scores = None
+
+        return scores, preds, encoder_states, label_scores
+
+    def decode_forced(self, encoder_states, ys):
+        bsz = ys.size(0)
+        seqlen = ys.size(1)
+        inputs = ys.narrow(1, 0, seqlen - 1)
+        inputs = torch.cat([self._starts(bsz), inputs], 1)
+        dec_out, _ = self.decoder(inputs, encoder_states)
+        logits = self.output(dec_out)
+        _, preds = logits.max(dim=2)
+        # label generator
+        label_dec_out, _ = self.label_decoder(inputs, encoder_states)
+        label_logits = self.output(label_dec_out)
+        # _, labe_preds = label_logits.max(dim=2)
+        return logits, preds, label_logits
+
+    def decode_greedy(self, encoder_states, bsz, maxlen):
+        xs = self._starts(bsz)
+        incr_state = None
+        logits = []
+        # generate template
+        for i in range(maxlen):
+            # todo, break early if all beams saw EOS
+            try:
+                dec_out, incr_state = self.decoder(xs, encoder_states, incr_state)
+                dec_out = dec_out[:, -1:, :]
+                if dec_out.size(1) > 1:
+                    print(1)
+            except:
+                print(1)
+            scores = self.output(dec_out)
+            _, preds = scores.max(dim=-1)
+            logits.append(scores)
+            xs = torch.cat([xs, preds], dim=1)
+            # check if everyone has generated an end token
+            all_finished = ((xs == self.END_IDX).sum(dim=1) > 0).sum().item() == bsz
+            if all_finished:
+                break
+        logits = torch.cat(logits, 1)
+        preds = xs
+
+        return logits, preds[:, 1:]
