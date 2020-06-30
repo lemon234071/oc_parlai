@@ -451,7 +451,7 @@ class TransformerGeneratorModel(TorchGeneratorModel):
         super().__init__()
         self.pad_idx = dictionary[dictionary.null_token]
         self.embeddings = _create_embeddings(
-            dictionary, opt['embedding_size'], self.pad_idx
+            dictionary.tokenizer.vocab, opt['embedding_size'], self.pad_idx
         )
 
         if opt.get('n_positions'):
@@ -472,11 +472,11 @@ class TransformerGeneratorModel(TorchGeneratorModel):
             raise ValueError('n_positions must be positive')
 
         self.encoder = _build_encoder(
-            opt, dictionary, self.embeddings, self.pad_idx, reduction=False,
+            opt, dictionary.tokenizer.vocab, self.embeddings, self.pad_idx, reduction=False,
             n_positions=n_positions,
         )
         self.decoder = _build_decoder(
-            opt, dictionary, self.embeddings, self.pad_idx,
+            opt, dictionary.tokenizer.vocab, self.embeddings, self.pad_idx,
             n_positions=n_positions,
         )
 
@@ -514,13 +514,8 @@ class TransformerGeneratorModel(TorchGeneratorModel):
         # generate template
         for i in range(maxlen):
             # todo, break early if all beams saw EOS
-            try:
-                dec_out, incr_state = self.decoder(xs, encoder_states, incr_state)
-                dec_out = dec_out[:, -1:, :]
-                if dec_out.size(1) > 1:
-                    print(1)
-            except:
-                print(1)
+            dec_out, incr_state = self.decoder(xs, encoder_states, incr_state)
+            dec_out = dec_out[:, -1:, :]
             scores = self.output(dec_out)
             _, preds = scores.max(dim=-1)
             logits.append(scores)

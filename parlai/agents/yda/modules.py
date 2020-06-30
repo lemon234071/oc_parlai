@@ -638,7 +638,7 @@ class YdaModel(TorchGeneratorModel):
         super().__init__()
         self.pad_idx = dictionary[dictionary.null_token]
         self.embeddings = _create_embeddings(
-            dictionary, opt['embedding_size'], self.pad_idx
+            dictionary.tokenizer.vocab, opt['embedding_size'], self.pad_idx
         )
 
         if opt.get('n_positions'):
@@ -659,15 +659,15 @@ class YdaModel(TorchGeneratorModel):
             raise ValueError('n_positions must be positive')
 
         self.encoder = _build_encoder(
-            opt, dictionary, self.embeddings, self.pad_idx, reduction=False,
+            opt, dictionary.tokenizer.vocab, self.embeddings, self.pad_idx, reduction=False,
             n_positions=n_positions,
         )
         self.decoder = _build_decoder(
-            opt, dictionary, self.embeddings, self.pad_idx,
+            opt, dictionary.tokenizer.vocab, self.embeddings, self.pad_idx,
             n_positions=n_positions,
         )
         self.label_decoder = _build_decoder(
-            opt, dictionary, self.embeddings, self.pad_idx,
+            opt, dictionary.tokenizer.vocab, self.embeddings, self.pad_idx,
             n_positions=n_positions, label_decoder=True
         )
 

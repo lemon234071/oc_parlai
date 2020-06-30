@@ -25,6 +25,8 @@ import numpy as np
 from collections import Counter
 
 from .modules import TransformerGeneratorModel
+from parlai.agents.bert_ranker.bert_dictionary import BertDictionaryAgent
+from parlai.agents.bert_ranker.helpers import add_common_args, surround
 
 
 class FaceTsfmAgent(TorchGeneratorAgent):
@@ -33,49 +35,15 @@ class FaceTsfmAgent(TorchGeneratorAgent):
     def add_cmdline_args(cls, argparser):
         """Add command-line arguments specifically for this agent."""
         agent = argparser.add_argument_group('Face Arguments')
-        # agent.add_argument('--init-model', type=str, default=None,
-        #                    help='load dict/model/opts from this path')
-        # agent.add_argument('-hs', '--hiddensize', type=int, default=128,
-        #                    help='size of the hidden layers')
-        # agent.add_argument('-esz', '--embeddingsize', type=int, default=128,
-        #                    help='size of the token embeddings')
-        # agent.add_argument('-nl', '--numlayers', type=int, default=2,
-        #                    help='number of hidden layers')
-        # agent.add_argument('-dr', '--dropout', type=float, default=0.1,
-        #                    help='dropout rate')
-        # agent.add_argument('-bi', '--bidirectional', type='bool',
-        #                    default=False,
-        #                    help='whether to encode the context with a '
-        #                         'bidirectional rnn')
-        # agent.add_argument('-att', '--attention', default='none',
-        #                    choices=['none', 'concat', 'general', 'dot',
-        #                             'local'],
-        #                    help='Choices: none, concat, general, local. '
-        #                         'If set local, also set attention-length. '
-        #                         '(see arxiv.org/abs/1508.04025)')
-        # agent.add_argument('-attl', '--attention-length', default=48, type=int,
-        #                    help='Length of local attention.')
-        # agent.add_argument('--attention-time', default='post',
-        #                    choices=['pre', 'post'],
-        #                    help='Whether to apply attention before or after '
-        #                         'decoding.')
-        # agent.add_argument('-dec', '--decoder', default='same',
-        #                    choices=['same', 'shared'],
-        #                    help='Choose between different decoder modules. '
-        #                         'Default "same" uses same class as encoder, '
-        #                         'while "shared" also uses the same weights. '
-        #                         'Note that shared disabled some encoder '
-        #                         'options--in particular, bidirectionality.')
-        agent.add_argument('-lt', '--lookuptable', default='unique',
-                           choices=['unique', 'enc_dec', 'dec_out', 'all'],
-                           help='The encoder, decoder, and output modules can '
-                                'share weights, or not. '
-                                'Unique has independent embeddings for each. '
-                                'Enc_dec shares the embedding for the encoder '
-                                'and decoder. '
-                                'Dec_out shares decoder embedding and output '
-                                'weights. '
-                                'All shares all three weights.')
+        argparser.add_argument('--bert-vocabulary-path', type=str, default="vocab.txt",
+                            help="path to the vocabulary file\n"
+                                 "See: https://github.com/huggingface/"
+                                 "pytorch-pretrained-BERT")
+        agent = argparser.add_argument_group('Yda Arguments')
+        agent.add_argument('--init-model', type=str, default=None,
+                           help='load dict/model/opts from this path')
+        agent.add_argument('-yda', '--yda', default=True,
+                           help='Yda training strategy.')
         agent.add_argument('-soft', '--numsoftmax', default=1, type=int,
                            help='default 1, if greater then uses mixture of '
                                 'softmax (see arxiv.org/abs/1711.03953).')
@@ -109,13 +77,21 @@ class FaceTsfmAgent(TorchGeneratorAgent):
                            help='Number of multihead attention heads')
         agent.add_argument('--learn-positional-embeddings', type='bool', default=False)
         agent.add_argument('--embeddings-scale', type='bool', default=True)
-        agent.add_argument('--n-positions', type=int, default=None, hidden=True,
+        agent.add_argument('--n-positions', type=int, default=512, hidden=True,
                            help='Number of positional embeddings to learn. Defaults '
                                 'to truncate or 1024 if not provided.')
+        agent.set_defaults(dict_maxexs=0)
 
         super(cls, FaceTsfmAgent).add_cmdline_args(argparser)
         FaceTsfmAgent.dictionary_class().add_cmdline_args(argparser)
         return agent
+
+    @staticmethod
+    def dictionary_class():
+        """
+        Determine the dictionary class.
+        """
+        return BertDictionaryAgent
 
     @staticmethod
     def model_version():
@@ -126,13 +102,13 @@ class FaceTsfmAgent(TorchGeneratorAgent):
         super().__init__(opt, shared)
         self.id = 'FACE'
         if getattr(self, 'word_freq', None) is None:
-            self.word_freq = np.zeros(len(self.dict))
+            self.word_freq = np.zeros(len(self.dict.tokenizer.vocab))
         self.ft = opt['frequency_type']
         self.wt = opt['weighing_time']
         self.cp = opt['confidence_penalty']
         self.beta = opt['beta']
         self.masked_entropy = HLoss(ignore_index=self.NULL_IDX)
-        self.ideal_entropy = math.log(1 / len(self.dict))
+        self.ideal_entropy = math.log(1 / len(self.dict.tokenizer.vocab))
 
     def build_model(self, states=None):
         self.model = TransformerGeneratorModel(self.opt, self.dict)
@@ -333,7 +309,8 @@ class FaceTsfmAgent(TorchGeneratorAgent):
                 break
             if i == self.NULL_IDX:
                 continue
-            new_vec.append(i)
+            elif i != self.START_IDX:
+                new_vec.append(i.item())
         return self.dict.vec2txt(new_vec)
 
     def _vectorize_text(self, text, add_start=False, add_end=False,

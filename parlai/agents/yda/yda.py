@@ -25,6 +25,8 @@ import numpy as np
 from collections import Counter
 
 from .modules import YdaModel
+from parlai.agents.bert_ranker.bert_dictionary import BertDictionaryAgent
+from parlai.agents.bert_ranker.helpers import add_common_args, surround
 
 
 class YdaAgent(TorchGeneratorAgent):
@@ -32,7 +34,12 @@ class YdaAgent(TorchGeneratorAgent):
     @classmethod
     def add_cmdline_args(cls, argparser):
         """Add command-line arguments specifically for this agent."""
-        agent = argparser.add_argument_group('Face Arguments')
+        #add_common_args(argparser)
+        argparser.add_argument('--bert-vocabulary-path', type=str, default="vocab.txt",
+                            help="path to the vocabulary file\n"
+                                 "See: https://github.com/huggingface/"
+                                 "pytorch-pretrained-BERT")
+        agent = argparser.add_argument_group('Yda Arguments')
         agent.add_argument('--init-model', type=str, default=None,
                            help='load dict/model/opts from this path')
         agent.add_argument('-yda', '--yda', default=True,
@@ -73,10 +80,25 @@ class YdaAgent(TorchGeneratorAgent):
         agent.add_argument('--n-positions', type=int, default=512, hidden=True,
                            help='Number of positional embeddings to learn. Defaults '
                                 'to truncate or 1024 if not provided.')
+        agent.set_defaults(dict_maxexs=0)  #
 
         super(cls, YdaAgent).add_cmdline_args(argparser)
         YdaAgent.dictionary_class().add_cmdline_args(argparser)
         return agent
+
+    @staticmethod
+    def dictionary_class():
+        """
+        Determine the dictionary class.
+        """
+        return BertDictionaryAgent
+
+    # def _set_text_vec(self, obs, truncate, split_lines):
+    #     super()._set_text_vec(obs, truncate, split_lines)
+    #     # concatenate the [CLS] and [SEP] tokens
+    #     if obs is not None and "text_vec" in obs:
+    #         obs["text_vec"] = surround(obs["text_vec"], self.START_IDX, self.END_IDX)
+    #     return obs
 
     @staticmethod
     def model_version():
@@ -87,13 +109,13 @@ class YdaAgent(TorchGeneratorAgent):
         super().__init__(opt, shared)
         self.id = 'FACE'
         if getattr(self, 'word_freq', None) is None:
-            self.word_freq = np.zeros(len(self.dict))
+            self.word_freq = np.zeros(len(self.dict.tokenizer.vocab))
         self.ft = opt['frequency_type']
         self.wt = opt['weighing_time']
         self.cp = opt['confidence_penalty']
         self.beta = opt['beta']
         self.masked_entropy = HLoss(ignore_index=self.NULL_IDX)
-        self.ideal_entropy = math.log(1 / len(self.dict))
+        self.ideal_entropy = math.log(1 / len(self.dict.tokenizer.vocab))
 
         self.yda = opt["yda"]
         self.metrics['cloze_correct_tokens'] = 0
@@ -331,7 +353,8 @@ class YdaAgent(TorchGeneratorAgent):
                 break
             if i == self.NULL_IDX:
                 continue
-            new_vec.append(i)
+            elif i != self.START_IDX:
+                new_vec.append(i.item())
         return self.dict.vec2txt(new_vec)
 
     def _vectorize_text(self, text, add_start=False, add_end=False,

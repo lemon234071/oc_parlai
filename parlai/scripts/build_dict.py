@@ -116,7 +116,7 @@ def build_dict(opt, skip_if_built=False):
             pbar = None
         while not world_dict.epoch_done():
             cnt += 1
-            if cnt > opt['dict_maxexs'] and opt['dict_maxexs'] > 0:
+            if cnt > opt['dict_maxexs'] and opt['dict_maxexs'] >= 0:
                 print('Processed {} exs, moving on.'.format(opt['dict_maxexs']))
                 # don't wait too long...
                 break
