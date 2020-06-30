@@ -619,6 +619,18 @@ class YdaLoss(nn.Module):
         v.scatter_(1, target.unsqueeze(1), -float('inf'))
         # v[gt_mask] = -float('inf')
         v[:, self.ignore_index] = -float('inf')
+        if True:
+            upper_values, upper_indices = torch.topk(v, 500, dim=1)
+            kth_upper = upper_values[:, -1].view([-1, 1])
+            kth_upper = kth_upper.repeat([1, v.shape[1]]).float()
+            upper_ignore = torch.lt(v, kth_upper)
+            v = v.masked_fill(upper_ignore, -10000)
+
+            lower_values, lower_indices = torch.topk(v, 2, dim=1)
+            kth_lower = lower_values[:, -1].view([-1, 1])
+            kth_lower = kth_lower.repeat([1, v.shape[1]]).float()
+            lower_ignore = torch.gt(v, kth_lower)
+            v = v.masked_fill(lower_ignore, -10000)
         v = v.softmax(dim=-1)
         return v
 
