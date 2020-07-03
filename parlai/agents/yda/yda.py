@@ -34,11 +34,11 @@ class YdaAgent(TorchGeneratorAgent):
     @classmethod
     def add_cmdline_args(cls, argparser):
         """Add command-line arguments specifically for this agent."""
-        #add_common_args(argparser)
+        # add_common_args(argparser)
         argparser.add_argument('--bert-vocabulary-path', type=str, default="vocab.txt",
-                            help="path to the vocabulary file\n"
-                                 "See: https://github.com/huggingface/"
-                                 "pytorch-pretrained-BERT")
+                               help="path to the vocabulary file\n"
+                                    "See: https://github.com/huggingface/"
+                                    "pytorch-pretrained-BERT")
         agent = argparser.add_argument_group('Yda Arguments')
         agent.add_argument('--init-model', type=str, default=None,
                            help='load dict/model/opts from this path')
@@ -107,7 +107,7 @@ class YdaAgent(TorchGeneratorAgent):
     def __init__(self, opt, shared=None):
         """Set up model."""
         super().__init__(opt, shared)
-        self.id = 'FACE'
+        self.id = 'yda'
         if getattr(self, 'word_freq', None) is None:
             self.word_freq = np.zeros(len(self.dict.tokenizer.vocab))
         self.ft = opt['frequency_type']
@@ -290,8 +290,10 @@ class YdaAgent(TorchGeneratorAgent):
                 f_label_scores = f_label_scores.view(-1, f_label_scores.size(-1))
                 label_loss = F.cross_entropy(f_label_scores, batch.label_vec.view(-1),
                                              ignore_index=self.criterion.ignore_index, reduction="sum")
-                loss = self.criterion(score_view, batch.label_vec.view(-1),
-                                      f_label_scores, batch.label_vec.size())
+                # loss = self.criterion(score_view, batch.label_vec.view(-1),
+                #                       f_label_scores, batch.label_vec.size())
+                loss = F.cross_entropy(score_view, batch.label_vec.view(-1),
+                                             ignore_index=self.criterion.ignore_index, reduction="sum")
                 self.metrics['cloze_correct_tokens'] += cloze_correct
                 self.metrics['cloze_loss'] += label_loss.item()
             else:
@@ -537,6 +539,8 @@ class YdaLoss(nn.Module):
         self.reduction = reduction
         self.sample_weight = sample_weight
         self.step = 0
+        self.token_coef = 0.5
+        self.vo = True
 
     def forward(self, output, target, label_scores, batch_shape):
         """
@@ -550,10 +554,12 @@ class YdaLoss(nn.Module):
         else:
             raise Exception
 
-        # epsilon = self._yida_vmax_epsilon(output, target, v)
-        epsilon = self._yida_halfmax_epsilon(output, target)
+        # epsilon = self._yida_halfmax_epsilon(output, target)
+        if not self.vo:
+            epsilon = self._yida_vmax_epsilon(output, target, v)
+        else:
+            epsilon, v_gtruth = self._yida_vo_epsilon(output, target, v)
 
-        self.sample_weight = True
         if self.sample_weight and not isinstance(label_scores, list):
             self.step += 1
             if self.step > 0:
@@ -574,7 +580,10 @@ class YdaLoss(nn.Module):
                 epsilon = weights.unsqueeze(0) * epsilon
                 epsilon = epsilon.view(-1)
 
-        confidence = 1 - epsilon
+        if not self.vo:
+            confidence = 1 - epsilon
+        else:
+            confidence = 1 - epsilon + epsilon * v_gtruth
         smoothing_penalty = epsilon.unsqueeze(-1) * v
 
         # model_prob = torch.zeros_like(epsilon, device=epsilon.device, dtype=torch.float)
@@ -596,7 +605,7 @@ class YdaLoss(nn.Module):
         epsilon = 1 - prob_max
         mask = epsilon.gt(0.5)
         epsilon[mask] = 0.5
-        epsilon = prob_gtruth / prob_max * epsilon
+        epsilon = (prob_gtruth / prob_max).pow(self.token_coef) * epsilon
         return epsilon
 
     def _yida_vmax_epsilon(self, output, target, v):
@@ -608,15 +617,31 @@ class YdaLoss(nn.Module):
         up_bond = 1 / (1 + maxv)
         mask = epsilon.gt(up_bond)
         epsilon[mask] = up_bond[mask]
-        epsilon = prob_gtruth / prob_max * epsilon
+        epsilon = (prob_gtruth / prob_max).pow(self.token_coef) * epsilon
         return epsilon
+
+    def _yida_vo_epsilon(self, output, target, v):
+        probs = output.detach().clone().softmax(dim=-1)
+        prob_max = probs.max(dim=1)[0]
+        prob_gtruth = probs.gather(dim=1, index=target.unsqueeze(1)).squeeze()
+        v_gtruth = v.gather(dim=1, index=target.unsqueeze(1)).squeeze()
+        epsilon = (prob_max - 1) / (v_gtruth - 1)
+        # epsilon = 1 - prob_max
+        v_other = v.scatter(1, target.unsqueeze(1), 0)
+        v_omax = v_other.max(dim=-1)[0]
+        up_bond = 1 / (1 + v_omax - v_gtruth)
+        mask = epsilon.gt(up_bond)
+        epsilon[mask] = up_bond[mask]
+        epsilon = (prob_gtruth / prob_max).pow(self.token_coef) * epsilon
+        return epsilon, v_gtruth
 
     def _v_diag(self, label_scores, target):
         # TODO(yida) grad thinking
         v = label_scores.detach().clone()
         v /= 1.5
         # temp_for_c = v.clone().softmax(dim=-1)[gt_mask]
-        v.scatter_(1, target.unsqueeze(1), -float('inf'))
+        if not self.vo:
+            v.scatter_(1, target.unsqueeze(1), -float('inf'))
         # v[gt_mask] = -float('inf')
         v[:, self.ignore_index] = -float('inf')
         if True:
@@ -624,13 +649,13 @@ class YdaLoss(nn.Module):
             kth_upper = upper_values[:, -1].view([-1, 1])
             kth_upper = kth_upper.repeat([1, v.shape[1]]).float()
             upper_ignore = torch.lt(v, kth_upper)
-            v = v.masked_fill(upper_ignore, -10000)
+            v = v.masked_fill(upper_ignore, -float('inf'))
 
             lower_values, lower_indices = torch.topk(v, 2, dim=1)
             kth_lower = lower_values[:, -1].view([-1, 1])
             kth_lower = kth_lower.repeat([1, v.shape[1]]).float()
             lower_ignore = torch.gt(v, kth_lower)
-            v = v.masked_fill(lower_ignore, -10000)
+            v = v.masked_fill(lower_ignore, -float('inf'))
         v = v.softmax(dim=-1)
         return v
 
